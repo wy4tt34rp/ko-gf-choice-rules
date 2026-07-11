@@ -1,109 +1,359 @@
-// KO – GF Choice Rules frontend (embedded-only, VALUE-based) v2.5.2
+/**
+ * KO – GF Choice Rules Frontend Engine
+ * Version: 2.8.0
+ * Description: Evaluates Simple + Advanced Gravity Forms choice-lock rules.
+ * No jQuery required. Compatible with GF conditional logic.
+ */
+
+/* eslint-env es6 */
+/* global Set, Map, Promise */
+
 (function () {
-  const qs  = (r, s) => (r || document).querySelector(s);
-  const qsa = (r, s) => Array.from((r || document).querySelectorAll(s));
-  const LOG = false; // set true to see debug logs
+  "use strict";
 
-  const log = (...a)=>{ if(LOG) console.log('[KO-GF]', ...a); };
+  function parseJsonSafe(str, fallback) {
+    if (!str) return fallback;
+    try {
+      return JSON.parse(str);
+    } catch (e) {
+      return fallback;
+    }
+  }
 
-  function getScriptEl(){ return qsa(document,'script').find(s => (s.src||'').includes('ko-gf-lock-frontend.js')); }
-  function getGFForms(){ return qsa(document,'.gform_wrapper form[id^="gform_"]'); }
-  function getFormId(f){ const m=(f.id||'').match(/^gform_(\d+)$/); return m?parseInt(m[1],10):0; }
-  function getTriggerInputs(f,id){ return qsa(f,`input[name="input_${id}"]`); }
-  function getTriggerValue(f,id){ const sel=qsa(f,`input[name="input_${id}"]:checked`); return sel.length?sel[0].value:''; }
-  function getTargetField(f,fid,id){ return qs(f,`#field_${fid}_${id}`); }
-  function getChoiceBlocks(tf){ if(!tf)return[]; let w=qs(tf,'.gfield_radio'); if(!w)return[]; let b=qsa(w,'.gchoice'); if(!b.length)b=qsa(w,'li'); return b; }
-  const baseVal = v => String(v||'').split('|')[0].trim();
+  function normalize(str) {
+    if (str == null) return "";
+    return String(str)
+      .replace(/\u00A0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
 
-  function applyRuleToForm(rule, form){
-    const fid=getFormId(form); if(fid!==parseInt(rule.form_id,10)) return;
-    const trigVal=getTriggerValue(form,rule.trigger_field);
-    const target=getTargetField(form,fid,rule.target_field); if(!target) return;
-    const blocks=getChoiceBlocks(target); if(!blocks.length) return;
+  function baseVal(str) {
+    if (str == null) return "";
+    var parts = String(str).split("|", 2);
+    return parts[0].trim();
+  }
 
-    const triggerMatches=(String(trigVal).toLowerCase().trim()===String(rule.trigger_value).toLowerCase().trim());
-    const shouldAct=(rule.logic_mode==='when_trigger_match')?triggerMatches:!triggerMatches;
-    const wanted=baseVal(rule.target_value);
+  function detectFormId(form) {
+    // Try gform_XX
+    if (form.id && form.id.indexOf("gform_") === 0) {
+      var idPart = form.id.replace("gform_", "");
+      var idNum = parseInt(idPart, 10);
+      if (!isNaN(idNum)) return idNum;
+    }
+    // Fallback: hidden input gf_form_id
+    var hidden = form.querySelector('input[name="gform_submit"]');
+    if (hidden && hidden.value) {
+      var idNum2 = parseInt(hidden.value, 10);
+      if (!isNaN(idNum2)) return idNum2;
+    }
+    return null;
+  }
 
-    blocks.forEach(el=>{
-      const input=qs(el,'input[type="radio"]'); if(!input) return;
-      const isTarget = wanted!=='' && baseVal(input.value)===wanted;
-      if(!isTarget) return;
+  function getFieldInputs(form, fieldId) {
+    if (!fieldId) return [];
+    return Array.prototype.slice.call(
+      form.querySelectorAll('[name="input_' + fieldId + '"]')
+    );
+  }
 
-      if(shouldAct){
-        if(rule.action==='disable'){
-          el.style.pointerEvents='none'; el.style.opacity='0.5';
-          if(input.checked){ input.checked=false; input.dispatchEvent(new Event('change',{bubbles:true})); }
-          input.disabled=true; input.setAttribute('aria-disabled','true');
-          log('disabled', {fid, field:rule.target_field, value:input.value});
-        }else{
-          el.style.display='none';
-          if(input.checked){ input.checked=false; input.dispatchEvent(new Event('change',{bubbles:true})); }
-          log('hid', {fid, field:rule.target_field, value:input.value});
-        }
-      }else{
-        el.style.display=''; el.style.pointerEvents=''; el.style.opacity='';
-        input.disabled=false; input.removeAttribute('aria-disabled'); input.removeAttribute('tabindex');
-        log('reverted', {fid, field:rule.target_field, value:input.value});
+  function getFieldValue(form, fieldId) {
+    var inputs = getFieldInputs(form, fieldId);
+    if (!inputs.length) return "";
+
+    var first = inputs[0];
+    var tag = (first.tagName || "").toLowerCase();
+    var type = (first.type || "").toLowerCase();
+
+    if (type === "radio") {
+      var checked = form.querySelector(
+        '[name="input_' + fieldId + '"]:checked'
+      );
+      return checked ? checked.value : "";
+    }
+
+    if (type === "checkbox") {
+      var checkedBoxes = inputs.filter(function (i) {
+        return i.checked;
+      });
+      return checkedBoxes
+        .map(function (i) {
+          return i.value;
+        })
+        .join(",");
+    }
+
+    if (tag === "select") {
+      if (first.multiple) {
+        var selected = Array.prototype.slice.call(
+          first.querySelectorAll("option:checked")
+        );
+        return selected
+          .map(function (o) {
+            return o.value;
+          })
+          .join(",");
       }
+      return first.value;
+    }
+
+    // text, number, etc.
+    return first.value;
+  }
+
+  function getChoiceWrapper(input) {
+    if (!input) return null;
+    return (
+      input.closest(".gchoice") ||
+      input.closest("li") ||
+      input.closest(".gfield_radio li") ||
+      input.parentElement
+    );
+  }
+
+  function resetChoiceState(input) {
+    var wrap = getChoiceWrapper(input);
+    if (wrap) {
+      wrap.style.display = "";
+      wrap.classList.remove("ko-gf-disabled-choice");
+      wrap.style.opacity = "";
+      wrap.style.pointerEvents = "";
+    }
+    input.disabled = false;
+  }
+
+  function applyActionToChoice(input, action) {
+    var wrap = getChoiceWrapper(input);
+    if (!wrap) return;
+
+    if (action === "hide") {
+      if (input.checked) {
+        input.checked = false;
+        // Trigger change so GF conditional logic reacts
+        var ev = new Event("change", { bubbles: true });
+        input.dispatchEvent(ev);
+      }
+      wrap.style.display = "none";
+    } else if (action === "disable") {
+      if (input.checked) {
+        input.checked = false;
+        var ev2 = new Event("change", { bubbles: true });
+        input.dispatchEvent(ev2);
+      }
+      input.disabled = true;
+      wrap.classList.add("ko-gf-disabled-choice");
+      wrap.style.opacity = "0.5";
+      wrap.style.pointerEvents = "none";
+    }
+  }
+
+  function evaluateNumericCondition(cond, valueRaw, form) {
+    if (valueRaw == null || valueRaw === "") return false;
+
+    var cleaned = String(valueRaw).replace(/,/g, "");
+    var num = parseFloat(cleaned);
+    if (isNaN(num)) return false;
+
+    var unitMode = cond.unit_mode || "";
+    if (unitMode === "miles_km" && cond.unit_field) {
+      var unitVal = getFieldValue(form, cond.unit_field) || "";
+      var unitNorm = unitVal.toString().toLowerCase();
+      if (
+        unitNorm.indexOf("kilometer") !== -1 ||
+        unitNorm.indexOf("km") !== -1
+      ) {
+        num = num * 0.621371; // km -> miles
+      }
+    }
+
+    var thresholdRaw = cond.value != null ? String(cond.value) : "";
+    var threshold = parseFloat(thresholdRaw.replace(/,/g, ""));
+    if (isNaN(threshold)) {
+      // No usable threshold; treat as pass
+      return true;
+    }
+
+    var op = cond.operator || "=";
+
+    switch (op) {
+      case "<":
+        return num < threshold;
+      case "<=":
+        return num <= threshold;
+      case ">":
+        return num > threshold;
+      case ">=":
+        return num >= threshold;
+      case "=":
+        return num === threshold;
+      case "!=":
+        return num !== threshold;
+      default:
+        return num === threshold;
+    }
+  }
+
+  function evaluateStringCondition(cond, valueRaw) {
+    var valNorm = normalize(valueRaw);
+    var targetNorm = normalize(cond.value);
+
+    var op = cond.operator || "=";
+    switch (op) {
+      case "=":
+        return valNorm === targetNorm;
+      case "!=":
+        return valNorm !== targetNorm;
+      case "contains":
+        return valNorm.indexOf(targetNorm) !== -1;
+      default:
+        return valNorm === targetNorm;
+    }
+  }
+
+  function evaluateAdvancedCondition(cond, form) {
+    var fieldId = cond.field_id;
+    if (!fieldId) return true; // nothing to check
+
+    var rawValue = getFieldValue(form, fieldId);
+
+    if ((cond.type || "numeric") === "numeric") {
+      return evaluateNumericCondition(cond, rawValue, form);
+    }
+
+    return evaluateStringCondition(cond, rawValue);
+  }
+
+  function evaluateSimpleRules(form, formId, rules) {
+    if (!Array.isArray(rules) || !rules.length) return;
+
+    rules.forEach(function (rule) {
+      if (parseInt(rule.form_id, 10) !== formId) return;
+
+      var triggerFieldId = parseInt(rule.trigger_field, 10);
+      var targetFieldId = parseInt(rule.target_field, 10);
+      if (!triggerFieldId || !targetFieldId) return;
+
+      var triggerValCurrent = getFieldValue(form, triggerFieldId);
+      var triggerMatches =
+        normalize(triggerValCurrent) === normalize(rule.trigger_value);
+
+      var logicMode = rule.logic_mode || "when_trigger_not_match";
+      var shouldAct =
+        logicMode === "when_trigger_match"
+          ? triggerMatches
+          : !triggerMatches;
+
+      if (!shouldAct) return;
+
+      var targetInputs = getFieldInputs(form, targetFieldId);
+      if (!targetInputs.length) return;
+
+      var targetBase = baseVal(rule.target_value);
+      targetInputs.forEach(function (input) {
+        if (baseVal(input.value) === targetBase) {
+          applyActionToChoice(input, rule.action || "hide");
+        }
+      });
     });
   }
 
-  function applyAllRules(rules){
-    const forms=getGFForms();
-    forms.forEach(form=>{
-      rules.forEach(r=>applyRuleToForm(r,form));
+  function evaluateAdvancedRules(form, formId, advRules) {
+    if (!Array.isArray(advRules) || !advRules.length) return;
 
-      if(!form.__ko_lock_wired){
-        const handled=new Set();
-        rules.filter(r=>getFormId(form)===parseInt(r.form_id,10)).forEach(r=>{
-          if(handled.has(r.trigger_field)) return; handled.add(r.trigger_field);
-          getTriggerInputs(form,r.trigger_field).forEach(inp=>{
-            inp.addEventListener('change',()=>rules.forEach(rr=>applyRuleToForm(rr,form)));
-          });
+    advRules.forEach(function (rule) {
+      if (parseInt(rule.form_id, 10) !== formId) return;
+      if (!Array.isArray(rule.conditions) || !rule.conditions.length) return;
+
+      var targetFieldId = parseInt(rule.target_field, 10);
+      if (!targetFieldId) return;
+
+      var action = rule.action || "hide";
+      var targetBase = baseVal(rule.target_value);
+
+      var targetInputs = getFieldInputs(form, targetFieldId);
+      if (!targetInputs.length) return;
+
+      targetInputs.forEach(function (input) {
+        if (baseVal(input.value) !== targetBase) return;
+
+        var allPass = rule.conditions.every(function (cond) {
+          return evaluateAdvancedCondition(cond, form);
         });
 
-        // Redraws inside the form (GF multi-page, conditional logic DOM swaps)
-        if('MutationObserver' in window){
-          const obs=new MutationObserver(()=>rules.forEach(r=>applyRuleToForm(r,form)));
-          obs.observe(form,{childList:true,subtree:true});
+        if (!allPass) {
+          // Conditions NOT met: apply action (hide/disable)
+          applyActionToChoice(input, action);
         }
-        form.__ko_lock_wired=true;
-      }
+        // If allPass === true, do nothing; base visible/enabled state wins
+      });
     });
   }
 
-  function bootOnce(rules){
-    if(!Array.isArray(rules)||!rules.length){ log('no rules'); return; }
+  function evaluateAllRulesForForm(form, formId, simpleRules, advRules) {
+    // Collect all target fields we touch so we can reset them first
+    var targetIds = new Set();
 
-    // POLL UNTIL trigger & target fields exist (handles late-render)
-    const deadline = Date.now()+4000; // up to 4s
-    (function waitAndApply(){
-      const ready = rules.every(r=>{
-        const form = qs(document, `#gform_${r.form_id}`);
-        return form && getTargetField(form, r.form_id, r.target_field);
+    if (Array.isArray(simpleRules)) {
+      simpleRules.forEach(function (r) {
+        if (parseInt(r.form_id, 10) === formId && r.target_field) {
+          targetIds.add(parseInt(r.target_field, 10));
+        }
       });
-      if(ready){
-        applyAllRules(rules);
-      }else if(Date.now()<deadline){
-        setTimeout(waitAndApply, 80);
-      }else{
-        // Apply anyway; the MutationObserver will catch subsequent inserts
-        applyAllRules(rules);
-      }
-    })();
+    }
+    if (Array.isArray(advRules)) {
+      advRules.forEach(function (r) {
+        if (parseInt(r.form_id, 10) === formId && r.target_field) {
+          targetIds.add(parseInt(r.target_field, 10));
+        }
+      });
+    }
+
+    // Reset state for all those target fields
+    targetIds.forEach(function (fieldId) {
+      var inputs = getFieldInputs(form, fieldId);
+      inputs.forEach(resetChoiceState);
+    });
+
+    // Apply simple, then advanced
+    evaluateSimpleRules(form, formId, simpleRules);
+    evaluateAdvancedRules(form, formId, advRules);
   }
 
-  function boot(){
-    const s=getScriptEl(); if(!s) return;
-    const data=s.getAttribute('data-ko-rules'); if(!data){ log('no data-ko-rules'); return; }
-    let rules; try{ rules=JSON.parse(data); } catch(e){ console.error('[KO GF Choice Rules] Bad rules JSON', e); return; }
-    bootOnce(rules);
+  function initForForms(simpleRules, advRules) {
+    var forms = document.querySelectorAll(".gform_wrapper form");
+    if (!forms.length) return;
+
+    Array.prototype.forEach.call(forms, function (form) {
+      var formId = detectFormId(form);
+      if (!formId) return;
+
+      var handler = function () {
+        evaluateAllRulesForForm(form, formId, simpleRules, advRules);
+      };
+
+      // Initial evaluation
+      handler();
+
+      // Re-evaluate on any input/change in the form
+      form.addEventListener("change", handler);
+      form.addEventListener("input", handler);
+    });
   }
 
-  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot); else boot();
+  document.addEventListener("DOMContentLoaded", function () {
+    // Find the script tag with our data attributes
+    var script = Array.prototype.slice
+      .call(document.scripts)
+      .find(function (s) {
+        return s.dataset && (s.dataset.koRules || s.dataset.koAdvRules);
+      });
 
-  // Debounced page-level observer for late-loaded forms
-  let t; function schedule(){ clearTimeout(t); t=setTimeout(boot, 60); }
-  if('MutationObserver' in window){ new MutationObserver(schedule).observe(document.documentElement,{childList:true,subtree:true}); }
+    if (!script) return;
+
+    var simpleRules = parseJsonSafe(script.dataset.koRules, []);
+    var advRules = parseJsonSafe(script.dataset.koAdvRules, []);
+
+    initForForms(simpleRules, advRules);
+  });
 })();
